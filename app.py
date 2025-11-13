@@ -8,7 +8,7 @@ import streamlit as st
 from sklearn.metrics.pairwise import cosine_similarity
 
 # -----------------------------
-# Embedding model
+# Embedding model (for RAG)
 # -----------------------------
 try:
     from sentence_transformers import SentenceTransformer
@@ -36,11 +36,10 @@ PHQ_ITEMS: List[PhqItem] = [
     PhqItem(5, "Poor appetite or overeating", "appetite"),
     PhqItem(6, "Feeling bad about yourself—or that you are a failure", "self_esteem"),
     PhqItem(7, "Trouble concentrating on things, such as reading or watching TV", "concentration"),
-    PhqItem(8, "Moving or speaking slowly or being very fidgety or restless", "psychomotor"),
-    PhqItem(9, "Thoughts that you would be better off dead or hurting yourself", "self_harm"),
-    PhqItem(10, "How difficult have these problems made it for you at work, home, or with others?", "functional", True),
+    PhqItem(8, "Moving or speaking slowly, or being very fidgety or restless", "psychomotor"),
+    PhqItem(9, "Thoughts that you would be better off dead or of hurting yourself", "self_harm"),
+    PhqItem(10, "How difficult have these problems made it for you at work, home, or with other people?", "functional", True),
 ]
-
 
 PHQ_BANDS = [
     (0, 4, "minimal"),
@@ -59,32 +58,33 @@ FUNCTIONAL_IMPAIRMENT_LABELS = {
 
 
 # -----------------------------
-# KNOWLEDGE BASE
+# SMALL KNOWLEDGE BASE (RAG)
 # -----------------------------
 
 KNOWLEDGE_BASE = [
     {
         "topic": "snowflake",
-        "chunk": "Snowflake Cortex offers serverless access to LLMs and embeddings near your data, "
-                 "letting teams build AI features securely without moving data out.",
-        "source": "Snowflake docs (summary)"
+        "chunk": "Snowflake Cortex offers serverless access to large language models and embeddings "
+                 "close to your data, so teams can build AI features without moving data out of Snowflake.",
+        "source": "Snowflake docs (summary)",
     },
     {
         "topic": "snowflake",
-        "chunk": "AISQL adds AI tasks like summarize, classify, or translate directly inside SQL. "
-                 "Cortex Analyst enables natural language questions on tables and documents.",
-        "source": "Snowflake docs (summary)"
+        "chunk": "AISQL lets you call AI tasks like summarize or classify directly from SQL. "
+                 "Cortex Analyst enables natural language questions over tables and documents.",
+        "source": "Snowflake docs (summary)",
     },
     {
         "topic": "emotive_ai",
-        "chunk": "Emotive or affective AI estimates emotions from voice, text, or expressions "
-                 "to respond with empathy and improve user support.",
-        "source": "Affective computing overview"
+        "chunk": "Emotive or affective AI tries to estimate feelings from voice, text, or expressions "
+                 "so systems can respond in a more caring and supportive way.",
+        "source": "Affective computing overview",
     },
     {
         "topic": "emotive_ai",
-        "chunk": "Ethical emotive AI requires transparency, fairness, human oversight, and avoiding stereotypes.",
-        "source": "Ethics notes"
+        "chunk": "Ethical emotive AI should be transparent, avoid stereotypes, reduce bias, "
+                 "and always keep a human in the loop for important decisions.",
+        "source": "Ethics notes",
     },
 ]
 
@@ -116,6 +116,7 @@ def build_knowledge_index():
 def rag_query(query: str, k=2):
     df, emb = build_knowledge_index()
     if emb is None:
+        # fallback if no embeddings: just first k notes
         return df.head(k).to_dict(orient="records")
     embedder = load_embedder()
     qvec = embedder.encode([query])
@@ -136,9 +137,11 @@ def start_session() -> str:
 
 
 def get_next_item(answers: Dict[int, int]) -> Optional[PhqItem]:
+    # items 1..9 first
     for it in PHQ_ITEMS:
         if not it.is_functional and it.item_id not in answers:
             return it
+    # then functional (10)
     if 10 not in answers:
         return next(i for i in PHQ_ITEMS if i.item_id == 10)
     return None
@@ -163,15 +166,29 @@ def score_phq(answers: Dict[int, int]):
     }
 
 
+def therapist_search_url(zip_code: str) -> str:
+    """
+    Build a Psychology Today therapist search link.
+    This does NOT contact anyone, it just opens a directory page.
+    """
+    base = "https://www.psychologytoday.com/us/therapists"
+    zip_clean = (zip_code or "").strip()
+    if zip_clean:
+        # Psychology Today supports ?search=ZIP style queries
+        return f"{base}?search={zip_clean}"
+    # fallback: generic US therapists page
+    return base
+
+
 # -----------------------------
-# STREAMLIT APP
+# STREAMLIT APP STATE & HEADER
 # -----------------------------
 
 SYSTEM_BLURB = (
-    "You are PediMinds, a warm, clear wellness assistant. "
-    "You guide PHQ-9 screenings with empathy and explain results simply. "
-    "If someone reports self-harm thoughts, you escalate safely. "
-    "You also answer basic questions about Snowflake AI and Emotive AI."
+    "You are PediMinds, a warm, clear wellness assistant (not a doctor). "
+    "You guide PHQ-9 mood check-ins, explain results in simple language, "
+    "and gently point people toward real human help when needed. "
+    "You can also answer short questions about Snowflake AI and emotive AI."
 )
 
 
@@ -180,17 +197,24 @@ def init_state():
         st.session_state.session_id = start_session()
     if "answers" not in st.session_state:
         st.session_state.answers = {}
+    if "phase" not in st.session_state:
+        st.session_state.phase = "intro"   # intro → screening → done
     if "last_rag_answer" not in st.session_state:
         st.session_state.last_rag_answer = None
-    if "phase" not in st.session_state:
-        st.session_state.phase = "screening"
+    if "nickname" not in st.session_state:
+        st.session_state.nickname = ""
+    if "feeling_word" not in st.session_state:
+        st.session_state.feeling_word = ""
+    if "zip_code" not in st.session_state:
+        st.session_state.zip_code = ""
 
 
 def reset_screening():
     st.session_state.session_id = start_session()
     st.session_state.answers = {}
-    st.session_state.phase = "screening"
+    st.session_state.phase = "intro"
     st.session_state.last_rag_answer = None
+    st.session_state.feeling_word = ""
 
 
 def render_header():
@@ -200,41 +224,137 @@ def render_header():
         layout="centered",
     )
     st.title("🩵 PediMinds — PHQ-9 Wellness Screener")
-    st.caption("A wellness check, not a diagnosis. If you feel unsafe, contact emergency services.")
+    st.caption(
+        "This is a **wellness check**, not a diagnosis. "
+        "If you ever feel unsafe or in crisis, please contact emergency services or a trusted professional."
+    )
 
     with st.sidebar:
         st.subheader("Paxalytica · AI for good")
         st.write(SYSTEM_BLURB)
         st.markdown("---")
-        st.write("This demo runs fully on Streamlit Cloud.")
+        st.write(
+            "PediMinds is a prototype and does **not** store your data in a database or contact anyone for you. "
+            "It simply runs in your browser to help you reflect and learn."
+        )
 
+
+# -----------------------------
+# INTRO / CHAT-LIKE WARMUP
+# -----------------------------
+
+def render_intro():
+    st.subheader("Let’s check in together 💬")
+
+    st.write(
+        "Hi, I’m **PediMinds**. I’m not a doctor, but I can help you walk through a short mood check "
+        "that many clinicians use. We’ll go slowly, one question at a time."
+    )
+    st.write(
+        "First, a couple of quick questions to make this feel a bit more personal. "
+        "You can skip anything you don’t want to answer."
+    )
+
+    nickname = st.text_input("What name or nickname would you like me to use (optional)?", value=st.session_state.nickname)
+    feeling = st.text_input("If you had to describe how you feel **today** in one or two words, what would you say?",
+                            value=st.session_state.feeling_word)
+    zip_code = st.text_input("ZIP code (optional, US only, used to suggest therapist directories later):",
+                             value=st.session_state.zip_code)
+
+    st.session_state.nickname = nickname.strip()
+    st.session_state.feeling_word = feeling.strip()
+    st.session_state.zip_code = zip_code.strip()
+
+    if st.button("Start wellness check ➜"):
+        st.session_state.phase = "screening"
+        st.rerun()
+
+
+# -----------------------------
+# SCREENING TAB
+# -----------------------------
 
 def render_screening():
     st.subheader("PHQ-9 Screening")
 
-    # If finished:
+    # Intro phase: chatty warm-up
+    if st.session_state.phase == "intro":
+        render_intro()
+        return
+
+    # Done phase: show results
     if st.session_state.phase == "done":
         res = score_phq(st.session_state.answers)
-        st.success(f"Your PHQ-9 total is **{res['total']}** ({res['band']}).")
+        total = res["total"]
+        band = res["band"].capitalize()
+        item9_flag = res["item9_positive"]
+        func = res["functional_impairment"]
 
-        if res["functional_impairment"]:
-            st.info(f"Impact on your daily life: **{res['functional_impairment']}**.")
+        name = st.session_state.nickname or "there"
 
-        if res["item9_positive"]:
-            st.error("⚠️ You indicated some thoughts of self-harm. "
-                     "This tool cannot keep you safe. Please reach out to a professional or emergency services.")
+        st.success(f"{name}, your PHQ-9 total is **{total}** ({band}).")
+
+        if func:
+            st.info(f"Impact on your daily life: **{func}**.")
+
+        # Safety and next steps
+        st.markdown("---")
+        st.markdown("### What this means (and what it doesn’t)")
+
+        st.write(
+            "This score is a **screening result**, not a full diagnosis. "
+            "It can be a useful starting point for a conversation with a doctor, therapist, or counselor."
+        )
+
+        if item9_flag:
+            st.error(
+                "⚠️ You indicated some **self-harm thoughts**. "
+                "This app cannot keep you safe in an emergency.\n\n"
+                "- If you are in immediate danger, call your local emergency number.\n"
+                "- In the U.S., you can call or text **988** (Suicide & Crisis Lifeline).\n"
+            )
+        else:
+            st.write(
+                "If these feelings have been strong, long-lasting, or are worrying you, "
+                "consider reaching out to a professional for support."
+            )
+
+        # Local therapist directory suggestion (non-automatic)
+        st.markdown("#### Find professional support")
+        url = therapist_search_url(st.session_state.zip_code)
+        if st.session_state.zip_code:
+            st.write(
+                f"If you’d like to look for a therapist near **{st.session_state.zip_code}**, "
+                f"you can search an online directory like Psychology Today:"
+            )
+        else:
+            st.write(
+                "You can search for therapists in your area using online directories. "
+                "For example:"
+            )
+        st.markdown(f"- [Search therapists on Psychology Today]({url})")
+
+        st.caption(
+            "PediMinds does **not** contact any therapist for you and does not share your answers with anyone. "
+            "These links are just for you to explore on your own."
+        )
 
         st.markdown("---")
         if st.button("🔁 Start over"):
             reset_screening()
         return
 
-    # Otherwise: still screening
+    # Still screening: ask next PHQ item
     next_item = get_next_item(st.session_state.answers)
     if not next_item:
         st.session_state.phase = "done"
-        st.experimental_rerun()
+        st.rerun()
         return
+
+    if not next_item.is_functional:
+        st.write(
+            "Over the **last 2 weeks**, how often have you been bothered by the following problem?"
+        )
 
     st.markdown(f"### Q{next_item.item_id}. {next_item.text}")
 
@@ -254,36 +374,57 @@ def render_screening():
         ]
 
     current = st.session_state.answers.get(next_item.item_id, 0)
-    choice = st.radio("Choose one:", [0,1,2,3], index=current, format_func=lambda x: labels[x])
+    choice = st.radio(
+        "Choose one option:",
+        [0, 1, 2, 3],
+        index=current,
+        format_func=lambda x: labels[x],
+    )
 
     if st.button("Next ➜"):
         st.session_state.answers[next_item.item_id] = int(choice)
         if get_next_item(st.session_state.answers) is None:
             st.session_state.phase = "done"
-        st.experimental_rerun()
+        st.rerun()
 
+
+# -----------------------------
+# AI QUESTIONS TAB
+# -----------------------------
 
 def render_rag():
     st.subheader("Ask PediMinds about AI")
 
-    q = st.text_input("Ask something like: 'What is Snowflake Cortex?'")
+    st.write(
+        "Here you can ask simple questions about **Snowflake AI** or **emotive/affective AI**. "
+        "Answers come from a small built-in note base, not from the internet."
+    )
+
+    q = st.text_input("Ask something like: *What is Snowflake Cortex?*")
 
     if st.button("Ask 🧠"):
         if q.strip():
             st.session_state.last_rag_answer = rag_query(q.strip(), k=2)
         else:
-            st.warning("Type a question first.")
+            st.warning("Please type a question first.")
 
     if st.session_state.last_rag_answer:
         st.markdown("#### Answer")
         chunks = " ".join([h["chunk"] for h in st.session_state.last_rag_answer])
         st.write(chunks)
 
-        st.caption("These are general summaries, not official documentation.")
+        st.caption(
+            "These are general summaries only. They do not replace official documentation, "
+            "legal advice, or professional guidance."
+        )
         with st.expander("Sources"):
             for h in st.session_state.last_rag_answer:
                 st.markdown(f"- **{h['source']}** → {h['chunk']}")
 
+
+# -----------------------------
+# MAIN
+# -----------------------------
 
 def main():
     init_state()
